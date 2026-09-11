@@ -8,16 +8,24 @@ import { fileURLToPath } from 'node:url';
 import { exec } from 'node:child_process';
 import { handleApi } from './api.mjs';
 import { configureBetsStorage, startScheduler } from './bets.mjs';
+import { configureTrackerStorage } from './tracker.mjs';
+import { configureRatings, ensureRatings } from './ratings.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4400);
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const BETS_FILE = path.join(DATA_DIR, 'bets.json');
+const TRACKER_FILE = path.join(DATA_DIR, 'tracker.json');
+const RATINGS_FALLBACK = path.join(__dirname, '..', 'public', 'data', 'ratings.json');
 
-configureBetsStorage({
-  read: () => (fs.existsSync(BETS_FILE) ? fs.readFileSync(BETS_FILE, 'utf8') : null),
-  write: (json) => { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(BETS_FILE, json); },
+const fileStorage = (file) => ({
+  read: () => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null),
+  write: (json) => { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(file, json); },
 });
+configureBetsStorage(fileStorage(BETS_FILE));
+configureTrackerStorage(fileStorage(TRACKER_FILE));
+configureRatings({ fallback: async () => JSON.parse(fs.readFileSync(RATINGS_FALLBACK, 'utf8')) });
+ensureRatings().then((r) => console.log(r ? `Ratingi: ${Object.keys(r.elo || {}).length} drużyn Elo, dane z ${r.generatedAt}` : 'Ratingi: brak (model działa na domyślnych wagach)')).catch(() => {});
 
 const app = express();
 app.use(compression());

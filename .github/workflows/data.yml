@@ -1,0 +1,52 @@
+name: Dane – Elo, xG, backtest, skuteczność (codziennie)
+
+on:
+  schedule:
+    - cron: '30 5 * * *'   # 05:30 UTC = 07:30 w Polsce
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data
+  cancel-in-progress: false
+
+jobs:
+  data:
+    name: Pipeline danych
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Poprzednie dane (gałąź data)
+        run: |
+          mkdir -p pipeline/out
+          if git fetch origin data 2>/dev/null; then
+            for f in history.json stats-cache.json predictions.json; do
+              git show origin/data:$f > pipeline/out/$f 2>/dev/null || true
+            done
+            echo "pobrano cache z gałęzi data"
+          else
+            echo "brak gałęzi data – pierwszy bieg"
+          fi
+      - name: Uruchom pipeline
+        run: node pipeline/run.mjs pipeline/out --max-stats=1500
+      - name: Publikuj gałąź data
+        run: |
+          cd pipeline/out
+          rm -rf .git
+          git init -q -b data
+          git config user.name "matchiq-data-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add ratings.json accuracy.json predictions.json history.json stats-cache.json summary.txt
+          git commit -q -m "dane $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
+          echo "opublikowano"
+      - name: Podsumowanie
+        run: cat pipeline/out/summary.txt >> "$GITHUB_STEP_SUMMARY"

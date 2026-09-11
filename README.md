@@ -21,17 +21,31 @@ Publiczne endpointy ESPN (scoreboard, summary, standings, teams, rankings, core 
 
 ## Jak liczone są szanse
 
-**Piłka nożna** (`server/football.mjs`)
-- Siła ataku i obrony = gole strzelone / stracone na mecz względem średniej ligi (sezon + ostatnie 5 meczów z wagą 35%, regularyzacja przy małej liczbie meczów).
-- Atut własnego boiska: typowy gospodarz strzela ~10% więcej, gość ~8% mniej, a do tego **bilans konkretnej drużyny u siebie / na wyjeździe** (punkty i gole).
-- Forma (5 ostatnich meczów z wagą malejącą), trend (ostatnie mecze vs sezon), **świeżość** (dni od ostatniego meczu, liczba meczów w 14 dni), **stawka meczu** (końcówka sezonu: walka o tytuł/puchary/utrzymanie vs środek tabeli), bezpośrednie mecze (spotkania u gospodarza liczą się mocniej), sygnały z sieci (kontuzje, zawieszenia, zwolnienia trenerów, powroty).
-- Z tego wychodzą oczekiwane gole (xG) → rozkład Poissona z korektą Dixona-Colesa → prawdopodobieństwa 1/X/2, powyżej 2,5 gola, BTTS i macierz wyników.
+**Piłka nożna** (`pipeline/model.mjs` + `server/football.mjs` – ten sam rdzeń w backteście i na żywo)
+- Siła ataku i obrony = gole strzelone / stracone na mecz względem średniej ligi (sezon + ostatnie mecze, regularyzacja przy małej liczbie meczów).
+- **Elo** liczone z dwóch sezonów wyników wszystkich 42 rozgrywek (ligi powiązane przez puchary europejskie), **xG ze strzałów** (własny model: gol ≈ a·celne + b·niecelne, dopasowany na tysiącach meczów z boxscore ESPN).
+- Atut własnego boiska: typowy gospodarz strzela więcej, gość mniej, a do tego **bilans konkretnej drużyny u siebie / na wyjeździe**.
+- Forma, trend (ostatnie mecze vs sezon), **świeżość** (dni od ostatniego meczu, natłok), **stawka meczu**, bezpośrednie mecze, **absencje** (kto z podstawowego składu z ostatnich 5 meczów nie wyszedł dziś w jedenastce), sygnały z sieci (kontuzje, zawieszenia, zwolnienia trenerów).
+- Z tego wychodzą oczekiwane gole → rozkład Poissona z korektą Dixona-Colesa → prawdopodobieństwa 1/X/2, powyżej 2,5 gola, BTTS i macierz wyników.
+- **Wagi są dopasowywane automatycznie** (minimalizacja log-loss) na meczach sprzed daty podziału i sprawdzane na późniejszych. Wyniki, kalibracja, porównanie z kursami i rankingi Elo są w zakładce **Model**.
 - Na żywo: aktualny wynik, minuta, momentum (strzały celne, strzały, posiadanie), czerwone kartki → szanse na wynik końcowy.
 - Werdykt zawiera „Za: …” – najważniejsze czynniki przemawiające za typem – oraz porównanie z kursami (✓ zgodnie / ≠ analiza).
 
 **Tenis** (`server/tennis.mjs`, `server/markov.mjs`)
-- Bazowe szanse z rankingu i punktów rankingowych, korekty za formę (10 ostatnich meczów + przebieg turnieju), bilans na nawierzchni i H2H.
+- Bazowe szanse z rankingu i punktów rankingowych oraz z **Elo z ostatnich 13 miesięcy (osobno na twardej, mączce i trawie)**, korekty za formę (10 ostatnich meczów + przebieg turnieju), bilans na nawierzchni i H2H.
 - Model Markowa punkt → gem → set (z tie-breakiem) → mecz: dobieramy skuteczność serwisu obu graczy tak, aby model dał szanse przedmeczowe, a potem liczymy szanse z dowolnego stanu meczu.
+
+## Pipeline danych (`pipeline/`)
+
+Codziennie o 7:30 (GitHub Actions, `data.yml`) uruchamia się `node pipeline/run.mjs`:
+1. `history.mjs` – wyniki z ESPN: piłka (sezony 2024/25, 2025/26 i bieżący, wszystkie ligi), tenis (13 miesięcy ATP/WTA); cache w gałęzi `data`.
+2. `elo.mjs` – Elo piłkarskie (z korektą za rozmiar zwycięstwa i regresją między sezonami) i tenisowe (ogólne + per nawierzchnia).
+3. `stats.mjs` – statystyki strzałów z boxscore → współczynniki xG i siły xG drużyn w bieżącym sezonie.
+4. `backtest.mjs` – model liczony wyłącznie z danych sprzed każdego meczu, dopasowanie wag, trafność / log-loss / Brier, kalibracja, per liga.
+5. `track.mjs` – prognozy pełnego modelu na następne 48 h zapisywane i rozliczane po meczach (trafność na żywo vs kursy).
+6. Wynik trafia do gałęzi `data` (`ratings.json`, `accuracy.json`, …). Aplikacja pobiera go sama (z paczką zapasową wbudowaną w build).
+
+Lokalnie: `node pipeline/run.mjs pipeline/out --skip-track --max-stats=9000` (pierwszy bieg ok. 10 min).
 
 ## Kupony (symulacja bankrollu)
 

@@ -1,8 +1,9 @@
 import React, { Suspense, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { usePolling, pct, f1, f2, fmtDate, fmtTime, plural } from '../../api';
-import type { FootballDetail, FormGame, LineupPlayer, MatchEvent, NewsHeadline, TableRow, TeamDetail } from '../../types';
+import { usePolling, apiJSON, pct, f1, f2, fmtDate, fmtTime, plural } from '../../api';
+import type { AbsenceInfo, FootballDetail, FormGame, LineupPlayer, MatchEvent, NewsHeadline, TableRow, TeamDetail } from '../../types';
 import { ProbBar, Gauge, Radar, Factors, Insights, StatCompare, ScoreHeat, Tile } from '../charts';
+import { useFavorites, shareText } from '../../favorites';
 
 const Pitch3D = React.lazy(() => import('../three/Pitch3D'));
 const ParticlesFX = React.lazy(() => import('../three/HeroScene').then((m) => ({ default: m.ParticlesFX })));
@@ -22,6 +23,23 @@ export default function FootballMatch({ leagueId, id, onBack, initialTab }: { le
   useEffect(() => { if (state) setIntervalMs(state === 'in' ? 20_000 : 180_000); }, [state]);
   const [tab, setTab] = useState<Tab>(TABS.includes(initialTab as Tab) ? (initialTab as Tab) : 'analiza');
   const [highlight, setHighlight] = useState<string | null>(null);
+  const [shared, setShared] = useState<string | null>(null);
+  const { isFav, toggle } = useFavorites();
+
+  // zapisz prognozę przedmeczową do „Moich prognoz” (raz na mecz)
+  const matchId = d.data?.summary.id;
+  const matchState = d.data?.summary.state;
+  useEffect(() => {
+    const dd = d.data;
+    if (!dd || dd.summary.state !== 'pre') return;
+    const key = `matchiq.tracked.${dd.summary.id}`;
+    try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, '1'); } catch { /* ignore */ }
+    apiJSON('/api/track', { method: 'POST', body: {
+      matchId: dd.summary.id, leagueId: dd.summary.league.id, leagueName: dd.summary.league.name, date: dd.summary.date,
+      home: dd.teams.home.short, away: dd.teams.away.short, homeLogo: dd.teams.home.logo, awayLogo: dd.teams.away.logo,
+      probs: dd.analysis.model, fav: dd.analysis.verdict.winner, confidence: dd.analysis.confidence, market: dd.analysis.market, why: dd.analysis.verdict.why || '',
+    } }).catch(() => {});
+  }, [matchId, matchState]);
 
   if (!d.data) {
     return (
@@ -45,11 +63,33 @@ export default function FootballMatch({ leagueId, id, onBack, initialTab }: { le
     { k: 'przebieg', label: 'Przebieg', n: data.events.length || undefined },
   ];
 
+  const share = async () => {
+    const text = [
+      `${teams.home.name} – ${teams.away.name} · ${m.league.name} · ${fmtDate(m.date)} ${fmtTime(m.date)}`,
+      `MatchIQ: ${a.verdict.text}${a.verdict.why ? ` (za: ${a.verdict.why})` : ''}`,
+      `Szanse: ${teams.home.short} ${pct(a.probs.home)} · remis ${pct(a.probs.draw)} · ${teams.away.short} ${pct(a.probs.away)} · xG ${f2(a.xg.home)}–${f2(a.xg.away)}`,
+      a.market ? `Kursy: ${pct(a.market.home)} / ${pct(a.market.draw)} / ${pct(a.market.away)} (${a.verdict.market?.agrees ? 'zgodne z analizą' : 'inne niż analiza'})` : '',
+      `https://diketes.github.io/matchiq/#/football/${encodeURIComponent(m.league.id)}/${m.id}`,
+    ].filter(Boolean).join('\n');
+    const r = await shareText(`MatchIQ: ${teams.home.short} – ${teams.away.short}`, text);
+    setShared(r === 'copied' ? 'Skopiowano do schowka' : r === 'shared' ? 'Udostępniono' : null);
+    setTimeout(() => setShared(null), 1800);
+  };
+  const favBtn = (t: TeamDetail) => (
+    <button className={`iconbtn${isFav(t.id) ? ' on' : ''}`} title={isFav(t.id) ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'} onClick={() => toggle({ id: t.id, name: t.name, sport: 'football', logo: t.logo })}>★</button>
+  );
+
   return (
     <div className="content-inner">
       <div className="mhead">
         <div className="bg" />
         <div className="canvas3d"><Suspense fallback={null}><ParticlesFX colorA={hc} colorB={ac} /></Suspense></div>
+        <div className="actions">
+          {shared && <span className="tag">{shared}</span>}
+          <button className="iconbtn" title="Udostępnij analizę" onClick={share}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" /><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4" /></svg>
+          </button>
+        </div>
         <div className="inner">
           <div className="meta">
             <button className="tag" onClick={onBack}>← Lista</button>
@@ -61,12 +101,12 @@ export default function FootballMatch({ leagueId, id, onBack, initialTab }: { le
             {data.referee && <span className="muted">· sędzia: {data.referee}</span>}
           </div>
           <div className="row">
-            <TeamSide t={teams.home} side="home" />
+            <TeamSide t={teams.home} side="home" fav={favBtn(teams.home)} elo={a.elo?.home} />
             <div className="center">
               <div className={`score${m.state === 'pre' ? ' pre' : ''}`}>{m.state === 'pre' ? fmtTime(m.date) : `${m.home.score ?? 0} : ${m.away.score ?? 0}`}</div>
               <div className={`status${live ? ' live' : ''}`}>{m.state === 'pre' ? 'Przed meczem' : live ? `${m.statusText}` : m.statusText}</div>
             </div>
-            <TeamSide t={teams.away} side="away" />
+            <TeamSide t={teams.away} side="away" fav={favBtn(teams.away)} elo={a.elo?.away} />
           </div>
           <div className="verdict">
             <div className="verdict-pill">
@@ -117,15 +157,16 @@ export default function FootballMatch({ leagueId, id, onBack, initialTab }: { le
   );
 }
 
-function TeamSide({ t, side }: { t: TeamDetail; side: 'home' | 'away' }) {
+function TeamSide({ t, side, fav, elo }: { t: TeamDetail; side: 'home' | 'away'; fav?: React.ReactNode; elo?: number }) {
   const form = (t.lastFive || []).slice(0, 5).map((g) => g.result);
   return (
     <div className={`side ${side}`}>
       {t.logo ? <img src={t.logo} alt="" /> : <div style={{ width: 64, height: 64, borderRadius: 16, background: t.color || 'var(--surface-3)' }} />}
       <div>
-        <div className="name" style={{ color: side === 'home' ? 'var(--home)' : 'var(--away)' }}>{t.name}</div>
+        <div className="name" style={{ color: side === 'home' ? 'var(--home)' : 'var(--away)', display: 'flex', alignItems: 'center', gap: 8, flexDirection: side === 'away' ? 'row-reverse' : 'row' }}>{t.name}{fav}</div>
         <div className="sub">
           {t.table && <span><b>{t.table.rank}.</b> w tabeli · {t.table.pts} pkt</span>}
+          {elo != null && <span>Elo <b>{elo}</b></span>}
           {t.record?.overall && t.record.overall.gp > 0 && <span>bilans <b>{t.record.overall.w}-{t.record.overall.d}-{t.record.overall.l}</b></span>}
           {form.length > 0 && <span style={{ display: 'inline-flex', gap: 3 }}>{form.map((r, i) => <i key={i} style={{ width: 14, height: 14, borderRadius: 4, display: 'inline-grid', placeItems: 'center', fontSize: 9, fontWeight: 800, fontStyle: 'normal', color: '#fff', background: r === 'W' ? 'var(--good)' : r === 'D' ? '#6b7280' : 'var(--critical)' }}>{r === 'W' ? 'Z' : r === 'D' ? 'R' : 'P'}</i>)}</span>}
           {t.formation && <span>ustawienie <b>{t.formation}</b></span>}
@@ -179,7 +220,10 @@ function AnalysisTab({ data }: { data: FootballDetail }) {
             {a.context && (a.context.home.restDays != null || a.context.away.restDays != null) && (
               <Tile label="Dni przerwy" value={<span><span className="home-c">{a.context.home.restDays ?? '–'}</span> · <span className="away-c">{a.context.away.restDays ?? '–'}</span></span>} sub={`${a.context.home.matches14} · ${a.context.away.matches14} meczów w 14 dni`} />
             )}
+            {a.elo && <Tile label="Elo (2 sezony)" value={<span><span className="home-c">{a.elo.home}</span> · <span className="away-c">{a.elo.away}</span></span>} sub={`${pct(a.elo.p)} dla gospodarza wg Elo`} />}
+            {a.xgData && <Tile label="xG / xGA na mecz" value={<span><span className="home-c">{f2(a.xgData.home.xgFor)}–{f2(a.xgData.home.xgAgainst)}</span></span>} sub={<span className="away-c">{f2(a.xgData.away.xgFor)}–{f2(a.xgData.away.xgAgainst)} ({a.xgData.away.gp} m.)</span>} />}
           </div>
+          {a.params && <div className="note" style={{ marginTop: 10 }}>{a.params.source === 'fitted' ? 'Wagi modelu dopasowane automatycznie na backteście (Elo, xG, forma, atut boiska).' : 'Wagi domyślne – ratingi z pipeline’u jeszcze się nie załadowały.'}</div>}
         </div>
       </div>
 
@@ -193,6 +237,13 @@ function AnalysisTab({ data }: { data: FootballDetail }) {
           <Radar axes={RADAR_AXES} home={a.ratings.home as any} away={a.ratings.away as any} homeName={teams.home.short} awayName={teams.away.short} />
         </div>
       </div>
+
+      {data.absences && (data.absences.home || data.absences.away) && (
+        <div className="grid c2">
+          <AbsenceCard name={teams.home.name} info={data.absences.home} color="var(--home)" />
+          <AbsenceCard name={teams.away.name} info={data.absences.away} color="var(--away)" />
+        </div>
+      )}
 
       <div className="grid c2">
         <div className="card">
@@ -232,6 +283,27 @@ function AnalysisTab({ data }: { data: FootballDetail }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function AbsenceCard({ name, info, color }: { name: string; info: AbsenceInfo | null; color: string }) {
+  return (
+    <div className="card">
+      <h3><span style={{ width: 10, height: 10, borderRadius: 3, background: color, display: 'inline-block' }} /> Skład vs ostatnie mecze: {name} <span className="hint">{info ? `${info.regulars} regularnych z ${info.matches} meczów` : 'brak składu'}</span></h3>
+      {!info ? <div className="note">Skład jeszcze nieogłoszony albo za mało danych z ostatnich meczów.</div> : info.missing.length === 0 ? (
+        <ul className="insights"><li className="strength"><span className="ic">✓</span><span>Pełna podstawowa jedenastka – wszyscy regularni gracze wychodzą od pierwszej minuty.</span></li></ul>
+      ) : (
+        <ul className="insights">
+          {info.missing.map((p) => (
+            <li key={p.name} className={p.onBench ? 'info' : 'warning'}>
+              <span className="ic">{p.onBench ? '↓' : '!'}</span>
+              <span><b>{p.name}</b>{p.pos ? ` (${p.pos})` : ''} – {p.onBench ? 'na ławce' : 'brak w kadrze meczowej'}; wychodził w podstawie w {p.starts} z {p.of} ostatnich meczów</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="note" style={{ marginTop: 8 }}>Każdy brakujący regularny zawodnik obniża oczekiwane gole drużyny o ok. {Math.round(4)}% (na ławce o połowę mniej).</div>
     </div>
   );
 }

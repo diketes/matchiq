@@ -36,3 +36,6 @@ ios/App/App.xcodeproj/project.xcworkspace/xcuserdata
 # zbudowane paczki
 *.apk
 *.ipa
+
+# wyniki pipeline'u danych (trafiają do gałęzi `data`, nie do main)
+pipeline/out/

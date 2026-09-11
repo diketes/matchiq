@@ -8,6 +8,7 @@ interface Props {
   query: string; onQuery: (q: string) => void;
   liveCount: number; onHome: () => void;
   bets: boolean; onBets: () => void;
+  model?: boolean; onModel?: () => void;
   mobile?: boolean;
 }
 
@@ -17,7 +18,7 @@ const shift = (key: string, days: number) => {
   return d.toLocaleDateString('en-CA');
 };
 
-export default function TopBar({ sport, onSport, date, onDate, today, query, onQuery, liveCount, onHome, bets, onBets, mobile }: Props) {
+export default function TopBar({ sport, onSport, date, onDate, today, query, onQuery, liveCount, onHome, bets, onBets, model, onModel, mobile }: Props) {
   const [now, setNow] = useState(new Date());
   useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t); }, []);
   const t = today || new Date().toLocaleDateString('en-CA');
@@ -54,6 +55,10 @@ export default function TopBar({ sport, onSport, date, onDate, today, query, onQ
           <button className={`bets-btn${bets ? ' active' : ''}`} onClick={onBets} title="Wirtualne kupony i bankroll">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v2a2 2 0 0 0 0 4v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-2a2 2 0 0 0 0-4z" /><path d="M13 6v12" strokeDasharray="2 3" /></svg>
             Kupony
+          </button>
+          <button className={`bets-btn${model ? ' active' : ''}`} onClick={onModel} title="Skuteczność modelu, Elo, backtest">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 20h18M5 17V9M10 17V4M15 17v-7M20 17v-4" /></svg>
+            Model
           </button>
         </>
       )}

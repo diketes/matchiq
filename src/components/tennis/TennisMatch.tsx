@@ -2,6 +2,7 @@ import React, { Suspense, useEffect, useState } from 'react';
 import { usePolling, pct, fmtDate, fmtTime } from '../../api';
 import type { TennisDetail, TennisPlayer, TennisResult } from '../../types';
 import { ProbBar, Gauge, Radar, Factors, Insights, Tile, PathBars } from '../charts';
+import { useFavorites, shareText } from '../../favorites';
 
 const Court3D = React.lazy(() => import('../three/Court3D'));
 
@@ -19,6 +20,8 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
   const state = d.data?.summary.state;
   useEffect(() => { if (state) setIntervalMs(state === 'in' ? 20_000 : 180_000); }, [state]);
   const [tab, setTab] = useState<Tab>(TABS.includes(initialTab as Tab) ? (initialTab as Tab) : 'analiza');
+  const [shared, setShared] = useState<string | null>(null);
+  const { isFav, toggle } = useFavorites();
 
   if (!d.data) {
     return (
@@ -31,11 +34,31 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
   const { summary: m, players, tournament: t, analysis: a } = data;
   const live = m.state === 'in';
   const H = players.home, A = players.away;
+  const share = async () => {
+    const text = [
+      `${H.name} – ${A.name} · ${t.name} (${t.surfacePl}) · ${fmtDate(m.date)} ${fmtTime(m.date)}`,
+      `MatchIQ: ${a.verdict.text}`,
+      `Szanse: ${H.short} ${pct(a.probs.home)} · ${A.short} ${pct(a.probs.away)}${a.elo ? ` · Elo ${a.elo.home} vs ${a.elo.away}` : ''}`,
+      `https://diketes.github.io/matchiq/#/tennis/${encodeURIComponent(m.league.id)}/${m.id}`,
+    ].join('\n');
+    const r = await shareText(`MatchIQ: ${H.short} – ${A.short}`, text);
+    setShared(r === 'copied' ? 'Skopiowano do schowka' : r === 'shared' ? 'Udostępniono' : null);
+    setTimeout(() => setShared(null), 1800);
+  };
+  const favBtn = (p: TennisPlayer) => (
+    <button className={`iconbtn${isFav(p.id) ? ' on' : ''}`} title={isFav(p.id) ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'} onClick={() => toggle({ id: p.id, name: p.name, sport: 'tennis', logo: p.flag })}>★</button>
+  );
 
   return (
     <div className="content-inner">
       <div className="mhead">
         <div className="bg" />
+        <div className="actions">
+          {shared && <span className="tag">{shared}</span>}
+          <button className="iconbtn" title="Udostępnij analizę" onClick={share}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" /><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4" /></svg>
+          </button>
+        </div>
         <div className="inner">
           <div className="meta">
             <button className="tag" onClick={onBack}>← Lista</button>
@@ -50,7 +73,7 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
             <span className="muted">· do {a.state.setsToWin} wygranych setów</span>
           </div>
           <div className="row">
-            <PlayerSide p={H} side="home" />
+            <PlayerSide p={H} side="home" fav={favBtn(H)} />
             <div className="center">
               {m.state === 'pre' ? <div className="score pre">{fmtTime(m.date)}</div> : (
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 18 }}>
@@ -60,7 +83,7 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
               )}
               <div className={`status${live ? ' live' : ''}`}>{m.state === 'pre' ? 'Przed meczem' : live ? `${m.statusText}${a.state.inTiebreak ? ' · tie-break' : ''}` : m.statusText}</div>
             </div>
-            <PlayerSide p={A} side="away" />
+            <PlayerSide p={A} side="away" fav={favBtn(A)} />
           </div>
           <div className="verdict">
             <div className="verdict-pill">
@@ -94,6 +117,7 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
                 <h3>Składowe prognozy przedmeczowej</h3>
                 <div className="tiles">
                   <Tile label="Ranking" value={pct(a.components.rank)} sub={`#${H.rank ?? '—'} vs #${A.rank ?? '—'}`} />
+                  {a.components.elo != null && a.elo && <Tile label={a.elo.surface ? 'Elo na nawierzchni' : 'Elo (12 mies.)'} value={pct(a.components.elo)} sub={`${a.elo.home} vs ${a.elo.away}`} color={a.components.elo > 0.55 ? 'var(--home)' : a.components.elo < 0.45 ? 'var(--away)' : undefined} />}
                   <Tile label="Forma" value={`${a.components.form >= 0 ? '+' : ''}${(a.components.form * 100).toFixed(1)} pp`} sub={`${a.form.home.wins}/${a.form.home.n} vs ${a.form.away.wins}/${a.form.away.n}`} color={a.components.form > 0.02 ? 'var(--home)' : a.components.form < -0.02 ? 'var(--away)' : undefined} />
                   <Tile label="Nawierzchnia" value={`${a.components.surface >= 0 ? '+' : ''}${(a.components.surface * 100).toFixed(1)} pp`} sub={`${a.surface.home.won}-${a.surface.home.lost} vs ${a.surface.away.won}-${a.surface.away.lost}`} />
                   <Tile label="H2H" value={`${a.components.h2h >= 0 ? '+' : ''}${(a.components.h2h * 100).toFixed(1)} pp`} sub={`${a.h2h.homeWins}-${a.h2h.awayWins}`} />
@@ -179,12 +203,12 @@ export default function TennisMatch({ tour, id, onBack, initialTab }: { tour: st
   );
 }
 
-function PlayerSide({ p, side }: { p: TennisPlayer; side: 'home' | 'away' }) {
+function PlayerSide({ p, side, fav }: { p: TennisPlayer; side: 'home' | 'away'; fav?: React.ReactNode }) {
   return (
     <div className={`side ${side}`}>
       {p.flag ? <img className="flag" src={p.flag} alt={p.country || ''} /> : <div className="flag" style={{ background: 'var(--surface-3)' }} />}
       <div>
-        <div className="name" style={{ color: side === 'home' ? 'var(--home)' : 'var(--away)' }}>{p.name}</div>
+        <div className="name" style={{ color: side === 'home' ? 'var(--home)' : 'var(--away)', display: 'flex', alignItems: 'center', gap: 8, flexDirection: side === 'away' ? 'row-reverse' : 'row' }}>{p.name}{fav}</div>
         <div className="sub">
           {p.rank && <span>ranking <b>#{p.rank}</b>{p.rankPrev && p.rankPrev !== p.rank ? <span className="muted"> ({p.rankPrev > p.rank ? '↑' : '↓'} z {p.rankPrev})</span> : null}</span>}
           {p.seed && <span>rozst. <b>{p.seed}</b></span>}

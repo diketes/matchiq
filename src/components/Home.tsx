@@ -1,16 +1,31 @@
 import React, { Suspense, useMemo } from 'react';
-import type { MatchItem, Sport } from '../types';
-import { fmtDayLabel, plural } from '../api';
+import type { AccuracyResponse, MatchItem, Sport, TrackedPrediction } from '../types';
+import { fmtDayLabel, plural, pct, usePolling, fmtTime } from '../api';
+import { useFavorites } from '../favorites';
 
 const HeroScene = React.lazy(() => import('./three/HeroScene'));
 
-interface Props { sport: Sport; matches: MatchItem[]; loading: boolean; onPick: (m: MatchItem) => void; today?: string; date: string; onShowList?: () => void }
+interface Props {
+  sport: Sport; matches: MatchItem[]; loading: boolean; onPick: (m: MatchItem) => void; today?: string; date: string;
+  onShowList?: () => void; onOpenMatch: (leagueId: string, id: string) => void; onModel: () => void;
+}
 
-export default function Home({ sport, matches, loading, onPick, today, date, onShowList }: Props) {
+const SectionTitle = ({ children }: { children: React.ReactNode }) => <h3 className="sect">{children}</h3>;
+
+export default function Home({ sport, matches, loading, onPick, today, date, onShowList, onOpenMatch, onModel }: Props) {
   const live = useMemo(() => matches.filter((m) => m.state === 'in').slice(0, 12), [matches]);
   const upcoming = useMemo(() => matches.filter((m) => m.state === 'pre' && m.dateKey === date).sort((a, b) => a.league.tier - b.league.tier || new Date(a.date).getTime() - new Date(b.date).getTime()).slice(0, 12), [matches, date]);
   const finished = useMemo(() => matches.filter((m) => m.state === 'post' && m.dateKey === date).sort((a, b) => a.league.tier - b.league.tier).slice(0, 8), [matches, date]);
   const t = today || date;
+  const acc = usePolling<AccuracyResponse>(sport === 'football' ? '/api/accuracy' : null, 10 * 60_000);
+  const picksOfDay = useMemo(() => {
+    const now = Date.now();
+    return (acc.data?.remote?.upcoming || []).filter((p) => new Date(p.date).getTime() > now - 2 * 3600_000 && new Date(p.date).getTime() < now + 40 * 3600_000).slice(0, 8);
+  }, [acc.data]);
+  const { favorites } = useFavorites();
+  const favMatches = useMemo(() => matches.filter((m) => favorites.some((f) => f.id === m.home.id || f.id === m.away.id)).slice(0, 8), [matches, favorites]);
+  const bt = acc.data?.remote?.backtest;
+  const tr = acc.data?.remote?.tracked;
 
   return (
     <div className="content-inner stack">
@@ -21,8 +36,8 @@ export default function Home({ sport, matches, loading, onPick, today, date, onS
         <div className="copy">
           <h1>{sport === 'football' ? <>Analiza meczów <span>piłkarskich</span> na żywo</> : <>Analiza meczów <span>tenisowych</span> na żywo</>}</h1>
           <p>{sport === 'football'
-            ? 'Wybierz mecz z listy: analiza liczy szanse na wygraną, remis i porażkę z formy, tabeli, bilansu u siebie/na wyjeździe, świeżości, stawki meczu, bezpośrednich meczów, sygnałów z sieci i przebiegu gry. Kursy bukmacherskie służą tylko do porównania.'
-            : 'Wybierz mecz z listy: model Markowa (punkt → gem → set → mecz) liczy szanse z rankingu, formy, nawierzchni i bieżącego wyniku. Do tego profile graczy, forma i bezpośrednie mecze.'}</p>
+            ? 'Kto wygra według analizy: Elo z dwóch sezonów, xG ze strzałów, forma, tabela, bilans u siebie i na wyjeździe, świeżość, absencje w składzie, bezpośrednie mecze i sygnały z sieci. Wagi dopasowane na tysiącach meczów, skuteczność sprawdzana codziennie. Kursy tylko do porównania.'
+            : 'Model Markowa (punkt → gem → set → mecz) z Elo per nawierzchnia, rankingu, formy i bieżącego wyniku. Do tego profile graczy, forma i bezpośrednie mecze.'}</p>
           <div className="pills">
             <span>{plural(matches.length, ['mecz', 'mecze', 'meczów'])} w oknie wczoraj–jutro</span>
             <span style={{ color: live.length ? '#ff8497' : undefined }}>{live.length} na żywo</span>
@@ -35,32 +50,55 @@ export default function Home({ sport, matches, loading, onPick, today, date, onS
 
       {loading && matches.length === 0 && <div className="loading"><div className="spinner" /> Pobieram mecze…</div>}
 
+      {sport === 'football' && picksOfDay.length > 0 && (
+        <section>
+          <SectionTitle>Typy dnia wg analizy <span className="muted">· najpewniejsze prognozy z codziennego trackera</span></SectionTitle>
+          <div className="typy">{picksOfDay.map((p) => <PickOfDay key={p.matchId} p={p} onOpen={onOpenMatch} />)}</div>
+        </section>
+      )}
+
+      {favorites.length > 0 && (
+        <section>
+          <SectionTitle>★ Twoje drużyny i zawodnicy <span className="muted">· {favorites.map((f) => f.name).slice(0, 4).join(', ')}{favorites.length > 4 ? '…' : ''}</span></SectionTitle>
+          {favMatches.length ? <div className="picks">{favMatches.map((m) => <Pick key={m.id} m={m} onPick={onPick} sport={sport} />)}</div> : <div className="card note">Brak meczów ulubionych w oknie wczoraj–jutro. Gwiazdkę dodajesz na stronie meczu.</div>}
+        </section>
+      )}
+
       {live.length > 0 && (
         <section>
-          <h3 style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-2)', marginBottom: 10 }}><span style={{ color: 'var(--live)' }}>●</span> Na żywo teraz</h3>
+          <SectionTitle><span style={{ color: 'var(--live)' }}>●</span> Na żywo teraz</SectionTitle>
           <div className="picks">{live.map((m) => <Pick key={m.id} m={m} onPick={onPick} sport={sport} />)}</div>
         </section>
       )}
       {upcoming.length > 0 && (
         <section>
-          <h3 style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-2)', marginBottom: 10 }}>Nadchodzące · {fmtDayLabel(date, t)}</h3>
+          <SectionTitle>Nadchodzące · {fmtDayLabel(date, t)}</SectionTitle>
           <div className="picks">{upcoming.map((m) => <Pick key={m.id} m={m} onPick={onPick} sport={sport} />)}</div>
         </section>
       )}
       {finished.length > 0 && (
         <section>
-          <h3 style={{ fontSize: 13, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-2)', marginBottom: 10 }}>Zakończone · {fmtDayLabel(date, t)}</h3>
+          <SectionTitle>Zakończone · {fmtDayLabel(date, t)}</SectionTitle>
           <div className="picks">{finished.map((m) => <Pick key={m.id} m={m} onPick={onPick} sport={sport} />)}</div>
         </section>
       )}
 
       <section className="grid c3">
+        <div className="card modelcard" onClick={onModel} style={{ cursor: 'pointer' }}>
+          <h3>Skuteczność modelu <span className="hint">zobacz →</span></h3>
+          {bt ? (
+            <div className="tiles" style={{ gridTemplateColumns: '1fr 1fr' }}>
+              <div className="tile"><div className="lbl">Backtest</div><div className="val" style={{ color: 'var(--accent)' }}>{pct(bt.test.model.accuracy, 1)}</div><div className="sub">{bt.test.n.toLocaleString('pl-PL')} meczów poza treningiem</div></div>
+              <div className="tile"><div className="lbl">Na żywo</div><div className="val">{tr && tr.settled ? pct(tr.all.model.accuracy, 1) : '—'}</div><div className="sub">{tr && tr.settled ? `${tr.settled} rozliczonych${tr.all.market.n ? ` · kursy ${pct(tr.all.market.accuracy, 1)}` : ''}` : 'zbieram prognozy'}</div></div>
+            </div>
+          ) : <p className="text-2" style={{ margin: 0, fontSize: 13 }}>Backtest na tysiącach meczów, kalibracja, porównanie z kursami, rankingi Elo i Twoje własne prognozy.</p>}
+        </div>
         <div className="card">
           <h3>Jak liczymy szanse</h3>
           <p className="text-2" style={{ margin: 0, fontSize: 13 }}>
             {sport === 'football'
-              ? 'Każda drużyna dostaje siłę ataku i obrony (gole strzelone/stracone względem średniej ligi, sezon + ostatnie 5 meczów), korektę za formę, bilans u siebie / na wyjeździe, świeżość (dni od ostatniego meczu), stawkę meczu i bezpośrednie mecze. Z tego wychodzą oczekiwane gole (xG), a rozkład Poissona z korektą Dixona-Colesa zamienia je na prawdopodobieństwa wyników.'
-              : 'Ranking i punkty rankingowe dają bazowe szanse, forma z 10 ostatnich meczów, bilans na danej nawierzchni i H2H je korygują. Następnie dobieramy skuteczność serwisu obu graczy tak, aby model Markowa (punkt → gem → set → mecz) dawał te szanse – i liczymy z niego dalej, także w trakcie meczu.'}
+              ? 'Siła ataku i obrony (sezon + ostatnie mecze), Elo z 2 sezonów, xG ze strzałów, bilans u siebie / na wyjeździe, forma, świeżość, stawka meczu, absencje w podstawowym składzie, H2H i sygnały z sieci dają oczekiwane gole. Rozkład Poissona z korektą Dixona-Colesa zamienia je na szanse 1/X/2, a wagi są dopasowane automatycznie na historii wyników.'
+              : 'Ranking i punkty rankingowe oraz Elo z ostatniego roku (osobno na twardej, mączce i trawie) dają bazowe szanse; forma, nawierzchnia i H2H je korygują. Model Markowa liczy z tego szanse także w trakcie meczu.'}
           </p>
         </div>
         <div className="card">
@@ -71,15 +109,33 @@ export default function Home({ sport, matches, loading, onPick, today, date, onS
               : 'W trakcie meczu model liczy szanse z aktualnego stanu setów i gemów (w tym tie-breaki). Prowadzenie 1:0 w setach przy równych siłach to ok. 75% szans, przełamanie w secie – ok. 90% na tego seta.'}
           </p>
         </div>
-        <div className="card">
-          <h3>Analiza, nie kursy</h3>
-          <p className="text-2" style={{ margin: 0, fontSize: 13 }}>
-            {sport === 'football'
-              ? 'Typ „kto wygra” wynika wyłącznie z analizy – kursy bukmacherskie nie wchodzą do prognozy. Pokazujemy je obok tylko dla porównania i wyraźnie zaznaczamy, gdy analiza wskazuje inny wynik niż rynek.'
-              : 'Dla tenisa pokazujemy składowe: ile szans wynika z rankingu, ile z formy, nawierzchni i bezpośrednich meczów. Pewność modelu spada w deblu i gdy brakuje danych o graczach spoza rankingu.'}
-          </p>
-        </div>
       </section>
+    </div>
+  );
+}
+
+function PickOfDay({ p, onOpen }: { p: TrackedPrediction; onOpen: (leagueId: string, id: string) => void }) {
+  const favName = p.fav === 'home' ? p.home : p.fav === 'away' ? p.away : 'Remis';
+  const marketFav = p.market ? (Object.keys(p.market) as ('home' | 'draw' | 'away')[]).reduce((b, k) => (p.market![k] > p.market![b] ? k : b), 'home' as 'home' | 'draw' | 'away') : null;
+  const agrees = marketFav ? marketFav === p.fav : null;
+  return (
+    <div className="typ" onClick={() => onOpen(p.leagueId, p.matchId)}>
+      <div className="lg"><span>{p.leagueName}</span><span>{new Date(p.date).toLocaleDateString('pl-PL', { day: 'numeric', month: 'short' })} {fmtTime(p.date)}</span></div>
+      <div className="vs">
+        <div className="t">{p.homeLogo && <img src={p.homeLogo} alt="" />}<span>{p.home}</span></div>
+        <div className="sc">vs</div>
+        <div className="t" style={{ flexDirection: 'row-reverse' }}>{p.awayLogo && <img src={p.awayLogo} alt="" />}<span>{p.away}</span></div>
+      </div>
+      <div className="probbar" style={{ height: 8 }}>
+        <div className="seg home" style={{ flex: p.probs.home }} />
+        <div className="seg draw" style={{ flex: p.probs.draw }} />
+        <div className="seg away" style={{ flex: p.probs.away }} />
+      </div>
+      <div className="typline">
+        <b className={p.fav === 'home' ? 'home-c' : p.fav === 'away' ? 'away-c' : ''}>{favName}</b> <span className="mono">{pct(p.probs[p.fav])}</span>
+        {agrees != null && <span className={`mkt-pill${agrees ? '' : ' differs'}`} style={{ marginLeft: 'auto', padding: '2px 8px', fontSize: 11 }}>{agrees ? 'kursy ✓' : 'kursy ≠'}</span>}
+      </div>
+      {p.why && <div className="note">Za: {p.why}</div>}
     </div>
   );
 }
@@ -98,7 +154,7 @@ function Pick({ m, onPick, sport }: { m: MatchItem; onPick: (m: MatchItem) => vo
         <div className="t" style={{ flexDirection: 'row-reverse' }}>{(sport === 'football' ? m.away.logo : m.away.flag) && <img src={sport === 'football' ? m.away.logo : m.away.flag} alt="" />}<span>{m.away.short}</span></div>
       </div>
       {m.market && m.state !== 'post' && (
-        <div className="probbar" style={{ height: 8 }}>
+        <div className="probbar" style={{ height: 8 }} title="Kursy (tylko podgląd)">
           <div className="seg home" style={{ flex: m.market.home }} />
           {m.market.draw != null && <div className="seg draw" style={{ flex: m.market.draw }} />}
           <div className="seg away" style={{ flex: m.market.away }} />

@@ -86,6 +86,7 @@ export interface LineupPlayer {
   id: string; name: string; short: string; jersey: string; position: string; positionPl: string; positionName?: string; starter: boolean; formationPlace: number; subbedIn: boolean; subbedOut: boolean; stats: PlayerStats; impact?: number; why?: string;
 }
 export interface Lineup { formation: string | null; starters: LineupPlayer[]; subs: LineupPlayer[] }
+export interface AbsenceInfo { matches: number; regulars: number; missingCount: number; missing: { name: string; pos: string; starts: number; of: number; onBench: boolean }[] }
 export interface MatchEvent { kind: string; minute: string; minuteNum: number; team: 'home' | 'away' | 'none'; players: string[]; text: string; typeText: string }
 export interface StatRow { key: string; label: string; home: number; away: number; pctType: boolean }
 export interface H2HGame { id: string; date: string; home: { id: string; name: string; short: string; logo?: string; score: number }; away: { id: string; name: string; short: string; logo?: string; score: number } }
@@ -121,6 +122,10 @@ export interface FootballAnalysis {
   newsAdj?: { home: number; away: number };
   strengths: { home: { attack: number; defense: number; ppg: number; form: number }; away: { attack: number; defense: number; ppg: number; form: number } };
   basis?: 'analysis';
+  params?: { source: 'default' | 'fitted'; elo: number; xg: number; form: number; homeAtt: number };
+  elo?: { home: number; away: number; diff: number; p: number; n: { home: number; away: number } } | null;
+  xgData?: { home: { xgFor: number; xgAgainst: number; gp: number }; away: { xgFor: number; xgAgainst: number; gp: number } } | null;
+  h2hScore?: number;
   context?: {
     home: { restDays: number | null; matches14: number; stakes: number; venueAttack: number; venueDefense: number; attackRecent: number; defenseRecent: number };
     away: { restDays: number | null; matches14: number; stakes: number; venueAttack: number; venueDefense: number; attackRecent: number; defenseRecent: number };
@@ -133,6 +138,7 @@ export interface FootballDetail {
   stats: StatRow[];
   events: MatchEvent[];
   lineups: { home: Lineup | null; away: Lineup | null };
+  absences?: { home: AbsenceInfo | null; away: AbsenceInfo | null } | null;
   news: { home: NewsHeadline[]; away: NewsHeadline[]; signal: { home: { neg: number; pos: number }; away: { neg: number; pos: number } } } | null;
   standings: TableRow[];
   standingsNote?: string;
@@ -168,6 +174,46 @@ export interface BetsState {
   coupons: Coupon[]; history: { t: string; bankroll: number; note?: string }[]; lastGeneratedDate: string | null; lastSettledAt: string | null; today: string;
 }
 
+// ---- skuteczność modelu ----
+export interface MetricSet { n: number; accuracy: number; logloss: number; brier: number }
+export interface CalibrationRow { range: string; n: number; predicted: number; actual: number }
+export interface SummaryBlock {
+  model: MetricSet; modelWithMarket: MetricSet; market: MetricSet;
+  disagree: { n: number; modelAccuracy: number; marketAccuracy: number }; agree: { n: number; accuracy: number };
+  calibration: CalibrationRow[]; byOutcome: Record<'home' | 'draw' | 'away', { n: number; predicted: number; hit: number; precision: number }>;
+  perLeague: { league: string; name: string; model: MetricSet; market: MetricSet }[];
+}
+export interface TrackedPrediction {
+  matchId: string; leagueId: string; leagueName: string; date: string; home: string; away: string; homeLogo?: string; awayLogo?: string;
+  probs: { home: number; draw: number; away: number }; fav: 'home' | 'draw' | 'away'; confidence?: number; market?: { home: number; draw: number; away: number } | null;
+  result?: 'home' | 'draw' | 'away'; score?: string; hit?: boolean; why?: string;
+}
+export interface BacktestPublic {
+  fittedAt: string; params: Record<string, number>;
+  test: { n: number; model: MetricSet; defaultParams: MetricSet; withoutElo: { accuracy: number; logloss: number }; withoutXg: { accuracy: number; logloss: number }; market: MetricSet; modelWithMarket: MetricSet; disagree: SummaryBlock['disagree']; agree: SummaryBlock['agree']; calibration: CalibrationRow[]; byOutcome: SummaryBlock['byOutcome']; perLeague: SummaryBlock['perLeague'] };
+  all: { n: number; model: MetricSet; market: MetricSet; modelWithMarket: MetricSet; calibration: CalibrationRow[]; perLeague: SummaryBlock['perLeague'] };
+  train: { n: number; logloss: number; from?: string; to?: string };
+  xg: { coef: { sot: number; other: number; corners: number }; n: number; corr: number | null; teams: number };
+  tennis: { n: number; accuracyAll: number; accuracySurface: number; days: number };
+  history: { footballMatches: number; tennisMatches: number; leagues: number; seasons?: Record<string, number>; splitDate?: string };
+}
+export interface AccuracyRemote {
+  generatedAt: string;
+  tracked: { all: SummaryBlock; last30: SummaryBlock; pending: number; settled: number; daily: { date: string; n: number; hit: number; marketHit: number; withMarket: number }[] } | null;
+  upcoming: TrackedPrediction[]; recent: TrackedPrediction[]; backtest: BacktestPublic;
+}
+export interface MyTracker {
+  n: number; pending: number; accuracy: number; brier: number; marketN: number; marketAccuracy: number;
+  disagree: { n: number; modelAccuracy: number; marketAccuracy: number }; items: TrackedPrediction[];
+}
+export interface AccuracyResponse { remote: AccuracyRemote | null; mine: MyTracker; ratings: { generatedAt: string; teams: number; xgTeams: number; tennisPlayers: number } | null; today: string }
+export interface EloResponse {
+  generatedAt: string | null;
+  leagues: { slug: string; name: string; region: string; tier: number; mean: number | null; teams: { id: string; name: string; elo: number; n: number; xg: { gp: number; xgFor: number; xgAgainst: number } | null }[] }[];
+  tennis: { atp: TennisEloRow[]; wta: TennisEloRow[] };
+}
+export interface TennisEloRow { id: string; name: string; tour: string; all: number; hard: number; clay: number; grass: number; n: number; nHard: number; nClay: number; nGrass: number }
+
 // ---- tenis ----
 export interface TennisResult {
   id: string; date: string; tournament?: string; round?: string; opponent: { id: string; name: string; rank?: number; seed?: number }; won: boolean; score: string; setsWon?: number; setsLost?: number; surface?: string; retired?: boolean;
@@ -194,7 +240,8 @@ export interface TennisAnalysis {
   h2h: { homeWins: number; awayWins: number; games: (TennisResult & { winner: 'home' | 'away' })[] };
   form: { home: { score: number; n: number; wins: number; setsLostPerMatch: number | null }; away: { score: number; n: number; wins: number; setsLostPerMatch: number | null } };
   surface: { home: { won: number; lost: number; n: number }; away: { won: number; lost: number; n: number } };
-  components: { rank: number; form: number; surface: number; h2h: number };
+  components: { rank: number; elo?: number | null; base?: number; form: number; surface: number; h2h: number };
+  elo?: { home: number; away: number; surface: boolean; homeAll: number; awayAll: number; homeSurf: number; awaySurf: number; homeN: number; awayN: number } | null;
 }
 export interface TennisDetail {
   summary: MatchItem;

@@ -2,6 +2,8 @@
 import { SITE, SITE_V2, getJSON, leagueBySlug, fetchFootballLeague, normalizeFootballEvent, moneylineToProbs, localDateKey, shiftDateKey } from './espn.mjs';
 import { plural, pct, f1, f2, clamp, round3, wMeczach, gen, MECZE, GOLE, ZWYC, PORAZKI } from './text.mjs';
 import { matchNews } from './news.mjs';
+import { DEFAULT_PARAMS, teamStrength, expectedGoals, predict, argmax, eloWinProb } from '../pipeline/model.mjs';
+import { ensureRatings, teamElo, teamXg, modelParams } from './ratings.mjs';
 
 const STAT_LABELS = {
   possessionPct: 'Posiadanie piłki (%)',
@@ -37,7 +39,7 @@ const POS_PL = {
 // ---------- pobieranie ----------
 export async function getFootballMatch(slug, id) {
   const league = leagueBySlug.get(slug) || { slug, name: slug, region: '', tier: 4 };
-  const summary = await getJSON(`${SITE}/soccer/${slug}/summary?event=${id}`, 20_000);
+  const [summary] = await Promise.all([getJSON(`${SITE}/soccer/${slug}/summary?event=${id}`, 20_000), ensureRatings().catch(() => null)]);
   const header = summary.header || {};
   const comp = header.competitions?.[0] || {};
   const state = comp.status?.type?.state || 'pre';
@@ -82,7 +84,10 @@ export async function getFootballMatch(slug, id) {
     away: { ...item.away, lastFive: lastFive.away, record: records.away, table: standings?.byTeam?.[awayId] || null, squad: squads.away, formation: lineups.away?.formation },
   };
 
-  const analysis = analyzeFootball({ item, teams, stats, events, lineups, standings, h2h, state, news });
+  // absencje: kto z podstawowego składu (ostatnie 5 meczów) nie wyszedł dziś w jedenastce
+  const absences = state === 'post' ? null : await detectAbsences(slug, teams, lineups).catch(() => null);
+
+  const analysis = analyzeFootball({ item, teams, stats, events, lineups, standings, h2h, state, news, absences });
 
   return {
     summary: item,
@@ -90,6 +95,7 @@ export async function getFootballMatch(slug, id) {
     stats,
     events,
     lineups,
+    absences,
     news: news ? { home: news.home.headlines, away: news.away.headlines, signal: { home: { neg: news.home.neg, pos: news.home.pos }, away: { neg: news.away.neg, pos: news.away.pos } } } : null,
     standings: standings?.rows || [],
     standingsNote: standings?.groupName,
@@ -101,6 +107,47 @@ export async function getFootballMatch(slug, id) {
     analysis,
     fetchedAt: new Date().toISOString(),
   };
+}
+
+// ---------- absencje (podstawowy skład z ostatnich meczów vs dzisiejsza jedenastka) ----------
+async function regularsFor(team, slug) {
+  const games = (team.lastFive || []).slice(0, 5);
+  if (games.length < 3) return null;
+  const sums = await Promise.all(games.map((g) => getJSON(`${SITE}/soccer/${slug}/summary?event=${g.id}`, 12 * 60 * 60_000).catch(() => null)));
+  const counts = new Map();
+  let n = 0;
+  for (const s of sums) {
+    const r = (s?.rosters || []).find((x) => String(x.team?.id) === String(team.id));
+    if (!r) continue;
+    const starters = (r.roster || []).filter((p) => p.starter);
+    if (starters.length < 7) continue;
+    n++;
+    for (const p of starters) {
+      const aid = p.athlete?.id;
+      if (!aid) continue;
+      const c = counts.get(aid) || { id: aid, name: p.athlete?.displayName || p.athlete?.shortName || '?', starts: 0, pos: POS_PL[p.position?.abbreviation] || p.position?.abbreviation || '' };
+      c.starts++;
+      counts.set(aid, c);
+    }
+  }
+  if (n < 3) return null;
+  return { n, regulars: [...counts.values()].filter((c) => c.starts >= Math.ceil(n * 0.6)) };
+}
+
+async function detectAbsences(slug, teams, lineups) {
+  const out = { home: null, away: null };
+  await Promise.all(['home', 'away'].map(async (side) => {
+    const lu = lineups[side];
+    if (!lu || lu.starters.length < 11) return;
+    const reg = await regularsFor(teams[side], slug);
+    if (!reg) return;
+    const starters = new Set(lu.starters.map((p) => String(p.id)));
+    const bench = new Set(lu.subs.map((p) => String(p.id)));
+    const missing = reg.regulars.filter((r) => !starters.has(String(r.id))).map((r) => ({ name: r.name, pos: r.pos, starts: r.starts, of: reg.n, onBench: bench.has(String(r.id)) }));
+    const missingCount = missing.reduce((s, m) => s + (m.onBench ? 0.5 : 1), 0);
+    out[side] = { matches: reg.n, regulars: reg.regulars.length, missing, missingCount };
+  }));
+  return out.home || out.away ? out : null;
 }
 
 // ---------- normalizacja ----------
@@ -361,51 +408,22 @@ function normalizeSquad(roster) {
   return { size: ath.length, avgAge: ages.length ? ages.reduce((s, x) => s + x, 0) / ages.length : null, byPos };
 }
 
-// ---------- model ----------
-function poissonPmf(lambda, k) {
-  let p = Math.exp(-lambda);
-  for (let i = 1; i <= k; i++) p *= lambda / i;
-  return p;
-}
-
-function scoreMatrix(lh, la, max = 8) {
-  const M = [];
-  let sum = 0;
-  for (let i = 0; i <= max; i++) {
-    M[i] = [];
-    for (let j = 0; j <= max; j++) { M[i][j] = poissonPmf(lh, i) * poissonPmf(la, j); sum += M[i][j]; }
-  }
-  for (let i = 0; i <= max; i++) for (let j = 0; j <= max; j++) M[i][j] /= sum;
-  return M;
-}
-
-function outcomesFromMatrix(M, curH = 0, curA = 0) {
-  let home = 0, draw = 0, away = 0, over25 = 0, btts = 0;
-  const finals = {};
-  for (let i = 0; i < M.length; i++) for (let j = 0; j < M[i].length; j++) {
-    const p = M[i][j];
-    const h = curH + i, a = curA + j;
-    if (h > a) home += p; else if (h < a) away += p; else draw += p;
-    if (h + a >= 3) over25 += p;
-    if (h >= 1 && a >= 1) btts += p;
-    const key = `${h}:${a}`;
-    finals[key] = (finals[key] || 0) + p;
-  }
-  const topScores = Object.entries(finals).map(([score, p]) => ({ score, p })).sort((a, b) => b.p - a.p).slice(0, 6);
-  return { home, draw, away, over25, btts, topScores };
-}
-
-const shrink = (x, n, k = 5) => (x * n + 1 * k) / (n + k);
-
-function formScore(lastFive) {
-  if (!lastFive?.length) return { score: 0.5, n: 0 };
-  const w = [1, 0.85, 0.7, 0.6, 0.5];
-  let num = 0, den = 0;
-  lastFive.slice(0, 5).forEach((g, i) => {
-    const pts = g.result === 'W' ? 3 : g.result === 'D' ? 1 : 0;
-    num += w[i] * pts; den += w[i] * 3;
-  });
-  return { score: den ? num / den : 0.5, n: Math.min(5, lastFive.length) };
+// ---------- model (rdzeń w pipeline/model.mjs – te same wagi co w backteście) ----------
+/** Stan drużyny z danych ESPN -> format modelu */
+function stateOf(team, side) {
+  const t = team.table;
+  const r = team.record?.overall;
+  let gp = 0, gf = 0, ga = 0, pts = 0, noGoals = false;
+  if (t && t.gp > 0 && !t.noGoals) { gp = t.gp; gf = t.gf; ga = t.ga; pts = t.pts; }
+  else if (r && r.gp > 0) { gp = r.gp; gf = r.gf; ga = r.ga; pts = r.pts; }
+  else if (t && t.gp > 0) { gp = t.gp; pts = t.pts; noGoals = true; }
+  return {
+    gp, gf, ga, pts, noGoals,
+    last5: (team.lastFive || []).slice(0, 5).map((g) => ({ gf: g.gf, ga: g.ga, result: g.result, date: g.date })),
+    split: team.record?.[side] || null,
+    overall: r || null,
+    table: t ? { rank: t.rank, teams: t.teams, gp: t.gp } : null,
+  };
 }
 
 function liveMinute(item) {
@@ -417,134 +435,60 @@ function liveMinute(item) {
   return minute;
 }
 
-function teamStrength(team, leagueAvg, side, matchDate) {
-  // siła ataku/obrony (1 = średnia ligi) z sezonu + ostatnich meczów, atut boiska, świeżość, stawka meczu
-  const t = team.table;
-  const r = team.record?.overall;
-  let gp = 0, gf = 0, ga = 0, pts = 0;
-  if (t && t.gp > 0 && !t.noGoals) { gp = t.gp; gf = t.gf; ga = t.ga; pts = t.pts; }
-  else if (r && r.gp > 0) { gp = r.gp; gf = r.gf; ga = r.ga; pts = r.pts; }
-  else if (t && t.gp > 0) { gp = t.gp; pts = t.pts; gf = leagueAvg * gp; ga = leagueAvg * gp; }
-  // uzupełnij ostatnimi meczami, gdy mało danych
-  const lf = team.lastFive || [];
-  if (gp < 3 && lf.length) {
-    const lgf = lf.reduce((s, g) => s + g.gf, 0), lga = lf.reduce((s, g) => s + g.ga, 0);
-    gp += lf.length; gf += lgf; ga += lga; pts += lf.reduce((s, g) => s + (g.result === 'W' ? 3 : g.result === 'D' ? 1 : 0), 0);
-  }
-  const attackSeason = gp ? shrink((gf / gp) / leagueAvg, gp) : 1;
-  const defenseSeason = gp ? shrink((ga / gp) / leagueAvg, gp) : 1;
-  // świeżość: ostatnie 5 meczów (35% wagi) – łapie zmianę trenera, kontuzje, serię
-  const recent = lf.slice(0, 5);
-  let attackRecent = attackSeason, defenseRecent = defenseSeason, wRecent = 0;
-  if (recent.length >= 3) {
-    const n = recent.length;
-    attackRecent = shrink((recent.reduce((s, g) => s + g.gf, 0) / n) / leagueAvg, n, 4);
-    defenseRecent = shrink((recent.reduce((s, g) => s + g.ga, 0) / n) / leagueAvg, n, 4);
-    wRecent = 0.35;
-  }
-  const attack = attackSeason * (1 - wRecent) + attackRecent * wRecent;
-  const defense = defenseSeason * (1 - wRecent) + defenseRecent * wRecent;
-  const ppg = gp ? pts / gp : 1.3;
-  const fs = formScore(lf);
-  // atut boiska: punkty u siebie / na wyjeździe vs całość oraz gole u siebie / na wyjeździe względem typowego zespołu
-  const split = team.record?.[side];
-  let venueFactor = 1, venueAttack = 1, venueDefense = 1;
-  if (split && split.gp >= 2) {
-    const sppg = (split.w * 3 + split.d) / split.gp;
-    venueFactor = clamp(1 + (sppg - ppg) * 0.05, 0.93, 1.07);
-  }
-  if (split && split.gp >= 3 && r && r.gp > split.gp && r.gf > 0 && r.ga > 0) {
-    const typAtt = side === 'home' ? 1.1 : 0.92, typDef = side === 'home' ? 0.92 : 1.1;
-    const ratioAtt = ((split.gf / split.gp) / (r.gf / r.gp)) / typAtt;
-    const ratioDef = ((split.ga / split.gp) / (r.ga / r.gp)) / typDef;
-    venueAttack = clamp(shrink(ratioAtt, split.gp, 8), 0.85, 1.18);
-    venueDefense = clamp(shrink(ratioDef, split.gp, 8), 0.85, 1.18);
-  }
-  // świeżość / natłok meczów (dni od ostatniego meczu, liczba meczów w 14 dni)
-  let restDays = null, matches14 = 0, fatigue = 1;
-  if (lf.length && matchDate) {
-    const md = new Date(matchDate).getTime();
-    const played = lf.map((g) => new Date(g.date).getTime()).filter((x) => Number.isFinite(x) && x < md);
-    if (played.length) {
-      restDays = Math.max(0, Math.round((md - Math.max(...played)) / 86400_000));
-      matches14 = played.filter((x) => md - x <= 14 * 86400_000).length;
-      if (restDays <= 2) fatigue = 0.96; else if (restDays === 3) fatigue = 0.985;
-      if (matches14 >= 5) fatigue *= 0.97;
-    }
-  }
-  // stawka meczu: końcówka sezonu – walka o tytuł/puchary/utrzymanie motywuje, środek tabeli mniej
-  let stakes = 0;
-  if (t && t.gp > 0 && t.teams >= 8 && t.rank) {
-    const progress = clamp(t.gp / ((t.teams - 1) * 2), 0, 1);
-    if (progress >= 0.6) {
-      if (t.rank <= 4 || t.rank >= t.teams - 3) stakes = 0.5;
-      else if (t.rank > 7 && t.rank < t.teams - 5) stakes = -0.3;
-    }
-  }
-  return { attack, defense, ppg, gp, gf, ga, pts, formScore: fs.score, formN: fs.n, venueFactor, venueAttack, venueDefense, attackRecent, defenseRecent, attackSeason, defenseSeason, restDays, matches14, fatigue, stakes };
-}
-
-/** Korekta Dixona-Colesa: Poisson zaniża remisy 0:0 i 1:1, zawyża 1:0 / 0:1 */
-function dixonColes(M, lh, la, rho = -0.08) {
-  const tau = (x, y) => {
-    if (x === 0 && y === 0) return 1 - lh * la * rho;
-    if (x === 0 && y === 1) return 1 + lh * rho;
-    if (x === 1 && y === 0) return 1 + la * rho;
-    if (x === 1 && y === 1) return 1 - rho;
-    return 1;
-  };
-  let sum = 0;
-  for (let i = 0; i < M.length; i++) for (let j = 0; j < M[i].length; j++) { M[i][j] *= tau(i, j); sum += M[i][j]; }
-  for (let i = 0; i < M.length; i++) for (let j = 0; j < M[i].length; j++) M[i][j] /= sum;
-  return M;
-}
-
-const argmax = (o) => Object.keys(o).reduce((b, k) => (o[k] > o[b] ? k : b), Object.keys(o)[0]);
-
-export function analyzeFootball({ item, teams, stats, events, lineups, standings, h2h, state, news = null }) {
+export function analyzeFootball({ item, teams, stats, events, lineups, standings, h2h, state, news = null, absences = null }) {
   const rows = standings?.rows || [];
   const totGP = rows.reduce((s, r) => s + r.gp, 0);
   const totGF = rows.reduce((s, r) => s + r.gf, 0);
   const leagueAvg = totGP > 0 && totGF > 0 ? clamp(totGF / totGP, 1.0, 1.9) : 1.35;
+  const params = modelParams(DEFAULT_PARAMS);
 
-  const H = teamStrength(teams.home, leagueAvg, 'home', item.date);
-  const A = teamStrength(teams.away, leagueAvg, 'away', item.date);
+  const H = teamStrength(stateOf(teams.home, 'home'), leagueAvg, 'home', params, item.date);
+  const A = teamStrength(stateOf(teams.away, 'away'), leagueAvg, 'away', params, item.date);
 
-  const formAdj = (fs) => 1 + 0.25 * (fs - 0.5);
-  // atut boiska: typowy gospodarz strzela ~10% więcej, gość ~8% mniej; do tego bilans konkretnej drużyny u siebie / na wyjeździe,
-  // forma, świeżość (dni od ostatniego meczu, natłok) i stawka meczu
-  let lh = leagueAvg * H.attack * A.defense * 1.10 * H.venueAttack * A.venueDefense * formAdj(H.formScore) * H.venueFactor * H.fatigue * (1 + 0.03 * H.stakes);
-  let la = leagueAvg * A.attack * H.defense * 0.92 * A.venueAttack * H.venueDefense * formAdj(A.formScore) * A.venueFactor * A.fatigue * (1 + 0.03 * A.stakes);
+  // Elo z historii wyników (pipeline) – wymaga min. 5 meczów w bazie u obu drużyn
+  const eloH = teamElo(teams.home.id), eloA = teamElo(teams.away.id);
+  const elo = eloH && eloA && eloH.n >= 5 && eloA.n >= 5 ? { home: eloH.elo, away: eloA.elo, diff: eloH.elo - eloA.elo, p: round3(eloWinProb(eloH.elo + 60 - eloA.elo)), n: { home: eloH.n, away: eloA.n } } : null;
+  // xG ze strzałów (bieżący sezon) – gdy obie drużyny mają dane
+  const xgH = teamXg(teams.home.id), xgA = teamXg(teams.away.id);
+  const xg = xgH && xgA ? { home: xgH, away: xgA } : null;
 
-  // H2H (lekka korekta; mecze u siebie gospodarza liczą się podwójnie)
+  // H2H: -1..1 (mecze u gospodarza liczą się mocniej)
   const hs = h2h?.summary;
-  let h2hAdj = 0;
+  let h2hScore = 0;
   if (hs && hs.total >= 3) {
-    const games = h2h.games || [];
     const homeId = teams.home.id;
     let w = 0, score = 0;
-    for (const g of games) {
+    for (const g of h2h.games || []) {
       const homeIsHost = g.home.id === homeId;
       const hsc = homeIsHost ? g.home.score : g.away.score, asc = homeIsHost ? g.away.score : g.home.score;
       const weight = homeIsHost ? 1.5 : 1;
       score += weight * (hsc > asc ? 1 : hsc < asc ? -1 : 0);
       w += weight;
     }
-    h2hAdj = w ? (score / w) * 0.06 : 0;
-    lh *= 1 + h2hAdj; la *= 1 - h2hAdj;
+    h2hScore = w ? score / w : 0;
   }
+  const h2hAdj = h2hScore * params.h2hWeight;
   // sygnały z sieci: kontuzje / zawieszenia / kryzys obniżają siłę, powroty lekko podnoszą
   const newsAdj = { home: 0, away: 0 };
   if (news) {
     newsAdj.home = -0.04 * Math.min(news.home.neg, 3) + 0.015 * Math.min(news.home.pos, 2);
     newsAdj.away = -0.04 * Math.min(news.away.neg, 3) + 0.015 * Math.min(news.away.pos, 2);
-    lh *= 1 + newsAdj.home; la *= 1 + newsAdj.away;
   }
-  lh = clamp(lh, 0.25, 4.2); la = clamp(la, 0.25, 4.2);
+  const absCount = absences ? { home: absences.home?.missingCount || 0, away: absences.away?.missingCount || 0 } : null;
+
+  const { lh, la } = expectedGoals({
+    H, A, leagueAvg, params,
+    eloDiff: elo ? elo.diff : null,
+    h2h: h2hScore,
+    xg: xg ? { home: { att: xg.home.att, def: xg.home.def }, away: { att: xg.away.att, def: xg.away.def } } : null,
+    absences: absCount,
+    news: newsAdj,
+    neutral: !!item.neutral,
+  });
 
   // model przedmeczowy (Poisson + korekta Dixona-Colesa na remisy)
-  const preM = dixonColes(scoreMatrix(lh, la), lh, la);
-  const pre = outcomesFromMatrix(preM);
+  const pre = predict(lh, la, params);
+  const preM = pre.matrix;
 
   // live / post
   const curH = Number(item.home.score ?? 0), curA = Number(item.away.score ?? 0);
@@ -575,8 +519,8 @@ export function analyzeFootball({ item, teams, stats, events, lineups, standings
     let lar = la * remaining * mFactorA;
     if (cards.home.red) { lhr *= 0.75 ** cards.home.red; lar *= 1.15; }
     if (cards.away.red) { lar *= 0.75 ** cards.away.red; lhr *= 1.15; }
-    const M = dixonColes(scoreMatrix(lhr, lar), lhr, lar);
-    live = { ...outcomesFromMatrix(M, curH, curA), xgRemaining: { home: lhr, away: lar }, minute, remainingMinutes: Math.max(0, Math.round(total - minute)) };
+    const lv = predict(lhr, lar, params, curH, curA);
+    live = { home: lv.home, draw: lv.draw, away: lv.away, over25: lv.over25, btts: lv.btts, topScores: lv.topScores, xgRemaining: { home: lhr, away: lar }, minute, remainingMinutes: Math.max(0, Math.round(total - minute)) };
     momentum = { home: momH, away: 1 - momH, weight };
   }
 
@@ -611,7 +555,7 @@ export function analyzeFootball({ item, teams, stats, events, lineups, standings
   };
 
   // czynniki
-  const factors = buildFactors({ H, A, teams, h2h, market, pre, momentum, cards, state });
+  const factors = buildFactors({ H, A, teams, h2h, market, pre, momentum, cards, state, elo, xg, absences });
   if (news && (news.home.neg || news.away.neg || news.home.pos || news.away.pos)) {
     factors.push({ key: 'siec', label: 'Sygnały z sieci', home: clamp(news.home.score / 3, -1, 1), away: clamp(news.away.score / 3, -1, 1), weight: 0.1, note: `kontuzje/zawieszenia: ${news.home.neg} vs ${news.away.neg} nagłówków` });
   }
@@ -632,13 +576,48 @@ export function analyzeFootball({ item, teams, stats, events, lineups, standings
     };
     addNews('home'); addNews('away');
   }
+  for (const side of ['home', 'away']) {
+    const ab = absences?.[side];
+    if (!ab) continue;
+    const absent = ab.missing.filter((m) => !m.onBench), bench = ab.missing.filter((m) => m.onBench);
+    if (absent.length) insights[side].unshift({ kind: 'warning', text: `Brak w kadrze meczowej: ${absent.map((m) => `${m.name}${m.pos ? ` (${m.pos})` : ''}`).join(', ')} – grali w ${absent[0].starts} z ${ab.matches} ostatnich meczów`, tag: 'skład' });
+    if (bench.length) insights[side].unshift({ kind: 'info', text: `Na ławce zamiast w podstawie: ${bench.map((m) => m.name).join(', ')} (rotacja)`, tag: 'skład' });
+    if (!ab.missing.length) insights[side].push({ kind: 'strength', text: `Pełna podstawowa jedenastka z ostatnich ${ab.matches} meczów`, tag: 'skład' });
+  }
+  if (elo) {
+    const strong = elo.diff >= 0 ? 'home' : 'away';
+    const weak = strong === 'home' ? 'away' : 'home';
+    const d = Math.abs(elo.diff);
+    if (d >= 80) {
+      insights[strong].unshift({ kind: 'strength', text: `Wyższe Elo (${strong === 'home' ? elo.home : elo.away} vs ${strong === 'home' ? elo.away : elo.home}) – wyniki z 2 sezonów, także w pucharach, za tą drużyną`, tag: 'elo' });
+      insights[weak].push({ kind: 'weakness', text: `Niższe Elo o ${Math.round(d)} pkt`, tag: 'elo' });
+    }
+  }
+  if (xg) {
+    for (const side of ['home', 'away']) {
+      const x = xg[side];
+      const other = teams[side].table;
+      if (x.att >= 1.15) insights[side].push({ kind: 'strength', text: `Tworzą dużo sytuacji: xG ${f2(x.xgFor)} na mecz (ze strzałów, ${x.gp} meczów)`, tag: 'xg' });
+      if (x.def >= 1.15) insights[side].push({ kind: 'weakness', text: `Dopuszczają rywali do wielu sytuacji: xGA ${f2(x.xgAgainst)} na mecz`, tag: 'xg' });
+      if (other && other.gp >= 5 && !other.noGoals) {
+        const goalsPer = other.gf / other.gp;
+        if (goalsPer - x.xgFor >= 0.45) insights[side].push({ kind: 'warning', text: `Strzelają więcej, niż wynika z sytuacji (${f2(goalsPer)} goli vs xG ${f2(x.xgFor)}) – możliwy spadek skuteczności`, tag: 'xg' });
+        if (x.xgFor - goalsPer >= 0.45) insights[side].push({ kind: 'info', text: `Marnują sytuacje (xG ${f2(x.xgFor)} vs ${f2(goalsPer)} goli) – forma strzelecka powinna się poprawić`, tag: 'xg' });
+      }
+      if (insights[side].length > 12) insights[side].length = 12;
+    }
+  }
 
   const keyPlayers = { home: keyPlayersFor(lineups.home, state), away: keyPlayersFor(lineups.away, state) };
 
   const verdict = buildVerdict({ item, probs, state, curH, curA, live, pre, factors, market });
 
   return {
-    basis: 'analysis', // prognoza wynika wyłącznie z analizy (forma, tabela, dom/wyjazd, H2H, świeżość, stawka, sygnały z sieci) – nie z kursów
+    basis: 'analysis', // prognoza wynika wyłącznie z analizy (forma, tabela, dom/wyjazd, H2H, świeżość, stawka, Elo, xG, absencje, sygnały z sieci) – nie z kursów
+    params: { source: params === DEFAULT_PARAMS ? 'default' : 'fitted', elo: params.eloWeight, xg: params.xgWeight, form: params.formWeight, homeAtt: params.homeAtt },
+    elo,
+    xgData: xg ? { home: { xgFor: xg.home.xgFor, xgAgainst: xg.home.xgAgainst, gp: xg.home.gp }, away: { xgFor: xg.away.xgFor, xgAgainst: xg.away.xgAgainst, gp: xg.away.gp } } : null,
+    h2hScore: round3(h2hScore),
     context: {
       home: { restDays: H.restDays, matches14: H.matches14, stakes: H.stakes, venueAttack: round3(H.venueAttack), venueDefense: round3(H.venueDefense), attackRecent: round3(H.attackRecent), defenseRecent: round3(H.defenseRecent) },
       away: { restDays: A.restDays, matches14: A.matches14, stakes: A.stakes, venueAttack: round3(A.venueAttack), venueDefense: round3(A.venueDefense), attackRecent: round3(A.attackRecent), defenseRecent: round3(A.defenseRecent) },
@@ -684,9 +663,15 @@ function teamRatings(team, S, side, cards, stats, key) {
   };
 }
 
-function buildFactors({ H, A, teams, h2h, market, pre, momentum, cards, state }) {
+function buildFactors({ H, A, teams, h2h, market, pre, momentum, cards, state, elo = null, xg = null, absences = null }) {
   const f = [];
   const sgn = (x) => clamp(x, -1, 1);
+  if (elo) f.push({ key: 'elo', label: 'Elo (wyniki z 2 sezonów)', home: sgn((elo.p - 0.5) * 2.5), away: sgn((0.5 - elo.p) * 2.5), weight: 0.22, note: `${elo.home} vs ${elo.away} → ${pct(elo.p)} dla gospodarza` });
+  if (xg) f.push({ key: 'xg', label: 'xG ze strzałów (sezon)', home: sgn((xg.home.att - xg.away.def) * 1.2 + (xg.away.def - 1) * 0.5), away: sgn((xg.away.att - xg.home.def) * 1.2 + (xg.home.def - 1) * 0.5), weight: 0.15, note: `xG ${f2(xg.home.xgFor)}–${f2(xg.home.xgAgainst)} vs ${f2(xg.away.xgFor)}–${f2(xg.away.xgAgainst)} na mecz` });
+  if (absences && (absences.home?.missing?.length || absences.away?.missing?.length)) {
+    const cnt = (s) => absences[s]?.missingCount || 0;
+    f.push({ key: 'absencje', label: 'Absencje w podstawowym składzie', home: sgn(-0.3 * cnt('home')), away: sgn(-0.3 * cnt('away')), weight: 0.14, note: `${absences.home?.missing?.length ?? 0} vs ${absences.away?.missing?.length ?? 0} brakujących z regularnej jedenastki` });
+  }
   f.push({ key: 'forma', label: 'Forma (ostatnie 5)', home: sgn((H.formScore - 0.5) * 2), away: sgn((A.formScore - 0.5) * 2), weight: 0.2, note: `${fmtForm(teams.home.lastFive)} vs ${fmtForm(teams.away.lastFive)}` });
   f.push({ key: 'tabela', label: 'Punkty na mecz (sezon)', home: sgn((H.ppg - 1.35) / 1.2), away: sgn((A.ppg - 1.35) / 1.2), weight: 0.2, note: `${f2(H.ppg)} vs ${f2(A.ppg)} pkt/mecz` });
   f.push({ key: 'atak', label: 'Siła ataku', home: sgn(H.attack - 1), away: sgn(A.attack - 1), weight: 0.15, note: `${f2(H.gp ? H.gf / H.gp : 0)} vs ${f2(A.gp ? A.gf / A.gp : 0)} goli/mecz` });

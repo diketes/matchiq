@@ -2,11 +2,13 @@
 import { CORE, getJSON, fetchTennisTour, guessSurface, tournamentCategory, ROUND_PL, mapLimit } from './espn.mjs';
 import { matchWin, solveServeEdge } from './markov.mjs';
 import { plural, pct, f1, clamp, round3, lata, MECZE, SETY, TYTULY, WYGRANE } from './text.mjs';
+import { playerElo, ensureRatings } from './ratings.mjs';
 
 const SURFACE_PL = { hard: 'twarda', clay: 'mączka (ceglana)', grass: 'trawa', carpet: 'dywan' };
 const SURFACE_LOC = { hard: 'na twardej nawierzchni', clay: 'na mączce', grass: 'na trawie', carpet: 'na dywanie' };
 
 export async function getTennisMatch(tour, compId) {
+  await ensureRatings().catch(() => null);
   const { matches, raw, rankMap } = await fetchTennisTour(tour);
   const item = matches.find((m) => m.id === String(compId));
   if (!item) { const e = new Error('Nie znaleziono meczu'); e.status = 404; throw e; }
@@ -157,6 +159,19 @@ export function analyzeTennis({ item, home, away, tournament, tour }) {
   const noRank = !home.rank && !away.rank;
   if (noRank) pRank = 0.5;
 
+  // Elo z historii wyników (ostatnie ~13 miesięcy), osobno per nawierzchnia
+  const eH = playerElo(home.id), eA = playerElo(away.id);
+  const surfKey = ['hard', 'clay', 'grass'].includes(tournament.surface) ? tournament.surface : 'hard';
+  const nKey = 'n' + surfKey.charAt(0).toUpperCase() + surfKey.slice(1);
+  let pElo = null, eloUsed = null;
+  if (eH && eA && eH.n >= 5 && eA.n >= 5 && !doubles) {
+    const useSurf = (eH[nKey] || 0) >= 6 && (eA[nKey] || 0) >= 6;
+    const rh = useSurf ? eH[surfKey] : eH.all, ra = useSurf ? eA[surfKey] : eA.all;
+    pElo = 1 / (1 + 10 ** ((ra - rh) / 400));
+    eloUsed = { home: rh, away: ra, surface: useSurf, homeAll: eH.all, awayAll: eA.all, homeSurf: eH[surfKey], awaySurf: eA[surfKey], homeN: eH.n, awayN: eA.n };
+  }
+  const pBase = pElo != null ? (noRank ? pElo : 0.5 * pRank + 0.5 * pElo) : pRank;
+
   // forma: ostatnie mecze + przebieg turnieju
   const formOf = (p) => {
     const all = [...(p.tournamentRun || []), ...(p.recent || [])].slice(0, 10);
@@ -189,7 +204,7 @@ export function analyzeTennis({ item, home, away, tournament, tour }) {
   let h2hAdj = 0;
   if (h2hGames.length >= 2) h2hAdj = 0.05 * ((h2h.homeWins - h2h.awayWins) / h2hGames.length);
 
-  const pPre = clamp(pRank + formAdj + surfAdj + h2hAdj, 0.04, 0.96);
+  const pPre = clamp(pBase + formAdj + surfAdj + h2hAdj, 0.04, 0.96);
 
   // model Markowa
   const base = tour === 'wta' ? 0.58 : 0.63;
@@ -223,12 +238,23 @@ export function analyzeTennis({ item, home, away, tournament, tour }) {
   confidence = clamp(confidence, 0.2, 0.97);
 
   const ratings = { home: playerRatings(home, fH, sH, live, 'home', setsH, setsA, gH, gA), away: playerRatings(away, fA, sA, live, 'away', setsA, setsH, gA, gH) };
-  const factors = buildFactors({ home, away, fH, fA, sH, sA, h2h, tournament, live, setsH, setsA, gH, gA, pRank });
+  const factors = buildFactors({ home, away, fH, fA, sH, sA, h2h, tournament, live, setsH, setsA, gH, gA, pRank, pElo, eloUsed });
   const insights = {
     home: playerInsights(home, fH, sH, h2h, 'home', tournament, state, setsH, setsA, gH, gA),
     away: playerInsights(away, fA, sA, h2h, 'away', tournament, state, setsA, setsH, gA, gH),
     match: matchInsights({ item, home, away, pre, live, probs, state, tournament, edge, h2h, setsH, setsA, gH, gA, inTiebreak }),
   };
+  if (eloUsed) {
+    const loc = eloUsed.surface ? (SURFACE_LOC[tournament.surface] || 'na tej nawierzchni') : 'z ostatnich 12 miesięcy';
+    insights.match.splice(1, 0, { kind: 'info', text: `Elo ${loc}: ${home.short} ${eloUsed.home} vs ${away.short} ${eloUsed.away} → ${pct(pElo)} szans dla ${home.short} (${eloUsed.homeN} i ${eloUsed.awayN} meczów w bazie)` });
+    const diff = eloUsed.home - eloUsed.away;
+    if (Math.abs(diff) >= 80) {
+      const strong = diff > 0 ? 'home' : 'away';
+      const weak = diff > 0 ? 'away' : 'home';
+      insights[strong].unshift({ kind: 'strength', text: `Wyraźnie wyższe Elo ${eloUsed.surface ? loc : ''} (${diff > 0 ? eloUsed.home : eloUsed.away} vs ${diff > 0 ? eloUsed.away : eloUsed.home}) – wyniki z ostatniego roku za tym graczem`, tag: 'elo' });
+      insights[weak].push({ kind: 'weakness', text: `Niższe Elo ${eloUsed.surface ? loc : ''} o ${Math.abs(Math.round(diff))} pkt`, tag: 'elo' });
+    }
+  }
   const dist = (state === 'in' && live ? live.dist : pre.dist);
   const paths = Object.entries(dist).map(([k, p]) => { const [x, y] = k.split('-').map(Number); return { label: `${x}:${y}`, winner: x > y ? 'home' : 'away', p: round3(p) }; }).sort((x, y) => y.p - x.p);
 
@@ -249,7 +275,8 @@ export function analyzeTennis({ item, home, away, tournament, tour }) {
     h2h,
     form: { home: fH, away: fA },
     surface: { home: sH, away: sA },
-    components: { rank: round3(pRank), form: round3(formAdj), surface: round3(surfAdj), h2h: round3(h2hAdj) },
+    components: { rank: round3(pRank), elo: pElo != null ? round3(pElo) : null, base: round3(pBase), form: round3(formAdj), surface: round3(surfAdj), h2h: round3(h2hAdj) },
+    elo: eloUsed,
   };
 }
 
@@ -275,10 +302,11 @@ function playerRatings(p, form, surf, live, side, mySets, oppSets, myGames, oppG
   };
 }
 
-function buildFactors({ home, away, fH, fA, sH, sA, h2h, tournament, live, setsH, setsA, gH, gA, pRank }) {
+function buildFactors({ home, away, fH, fA, sH, sA, h2h, tournament, live, setsH, setsA, gH, gA, pRank, pElo = null, eloUsed = null }) {
   const f = [];
   const sgn = (x) => clamp(x, -1, 1);
-  f.push({ key: 'ranking', label: 'Ranking', home: sgn((pRank - 0.5) * 2.2), away: sgn((0.5 - pRank) * 2.2), weight: 0.35, note: `#${home.rank ?? '—'} vs #${away.rank ?? '—'}` });
+  f.push({ key: 'ranking', label: 'Ranking', home: sgn((pRank - 0.5) * 2.2), away: sgn((0.5 - pRank) * 2.2), weight: pElo != null ? 0.22 : 0.35, note: `#${home.rank ?? '—'} vs #${away.rank ?? '—'}` });
+  if (pElo != null && eloUsed) f.push({ key: 'elo', label: eloUsed.surface ? `Elo ${SURFACE_LOC[tournament.surface] || 'na nawierzchni'}` : 'Elo (wyniki z 12 mies.)', home: sgn((pElo - 0.5) * 2.2), away: sgn((0.5 - pElo) * 2.2), weight: 0.22, note: `${eloUsed.home} vs ${eloUsed.away} (${eloUsed.homeN} / ${eloUsed.awayN} meczów)` });
   f.push({ key: 'forma', label: 'Forma (ostatnie 10)', home: sgn((fH.score - 0.5) * 2), away: sgn((fA.score - 0.5) * 2), weight: 0.2, note: `${fH.wins}/${fH.n} vs ${fA.wins}/${fA.n} wygranych` });
   if (sH.n >= 3 || sA.n >= 3) f.push({ key: 'nawierzchnia', label: `Bilans ${SURFACE_LOC[tournament.surface] || 'na nawierzchni'}`, home: sH.n ? sgn((sH.won / sH.n - 0.5) * 2) : 0, away: sA.n ? sgn((sA.won / sA.n - 0.5) * 2) : 0, weight: 0.12, note: `${sH.won}-${sH.lost} vs ${sA.won}-${sA.lost}` });
   if (h2h.games.length) f.push({ key: 'h2h', label: 'Bezpośrednie mecze', home: sgn((h2h.homeWins - h2h.awayWins) / h2h.games.length), away: sgn((h2h.awayWins - h2h.homeWins) / h2h.games.length), weight: 0.1, note: `${h2h.homeWins}-${h2h.awayWins}` });
