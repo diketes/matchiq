@@ -32,3 +32,7 @@ ios/App/DerivedData
 ios/App/App.xcworkspace/xcuserdata
 ios/App/App.xcodeproj/xcuserdata
 ios/App/App.xcodeproj/project.xcworkspace/xcuserdata
+
+# zbudowane paczki
+*.apk
+*.ipa
