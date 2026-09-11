@@ -31,7 +31,7 @@ jobs:
       - uses: android-actions/setup-android@v3
       - run: npm ci
       - name: Świeże ratingi do paczki zapasowej
-        run: curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data – zostaje wbudowana paczka"
+        run: mkdir -p public/data && (curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data – zostaje wbudowana paczka")
       - run: npm run build:mobile
       - run: npx cap sync android
       - name: Klucz podpisu (z sekretów repozytorium)
@@ -73,7 +73,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Świeże ratingi do paczki zapasowej
-        run: curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data"
+        run: mkdir -p public/data && (curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data")
       - run: npm run build:mobile
       - name: Projekt iOS
         run: |
@@ -131,7 +131,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Świeże ratingi do paczki zapasowej
-        run: curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data"
+        run: mkdir -p public/data && (curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/data/ratings.json -o public/data/ratings.json || echo "brak gałęzi data")
       - run: npm run build:mobile
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
