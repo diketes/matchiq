@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MatchIQ</string>
+    <string name="title_activity_main">MatchIQ</string>
+    <string name="package_name">pl.matchiq.app</string>
+    <string name="custom_url_scheme">pl.matchiq.app</string>
+</resources>

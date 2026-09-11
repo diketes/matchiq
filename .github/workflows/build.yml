@@ -1,0 +1,135 @@
+name: Build – Android APK, iOS IPA, strona PWA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - run: npm ci
+      - run: npm run build:mobile
+      - run: npx cap sync android
+      - name: Klucz podpisu (z sekretów repozytorium)
+        env:
+          KS_B64: ${{ secrets.MATCHIQ_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            mkdir -p android/keystore
+            echo "$KS_B64" | base64 -d > android/keystore/matchiq.jks
+            echo "MATCHIQ_KEYSTORE_PATH=$PWD/android/keystore/matchiq.jks" >> "$GITHUB_ENV"
+            echo "Klucz podpisu: OK"
+          else
+            echo "Brak sekretu MATCHIQ_KEYSTORE_B64 – APK zostanie podpisany kluczem debug"
+          fi
+      - name: Build APK (release)
+        env:
+          MATCHIQ_KEYSTORE_PASSWORD: ${{ secrets.MATCHIQ_KEYSTORE_PASSWORD }}
+          MATCHIQ_KEY_ALIAS: ${{ secrets.MATCHIQ_KEY_ALIAS }}
+          MATCHIQ_KEY_PASSWORD: ${{ secrets.MATCHIQ_KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk ../MatchIQ.apk
+          ls -la ../MatchIQ.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MatchIQ-android
+          path: MatchIQ.apk
+
+  ios:
+    name: iOS IPA (bez podpisu – do Sideloadly / AltStore)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:mobile
+      - name: Projekt iOS
+        run: |
+          if [ ! -d ios ]; then npx cap add ios; fi
+          npx cap sync ios
+      - name: Build (xcodebuild, bez podpisu)
+        run: |
+          cd ios/App
+          xcodebuild -project App.xcodeproj -scheme App -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build | tail -40
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/App.app Payload/
+          zip -qr ../../MatchIQ-iOS-unsigned.ipa Payload
+          ls -la ../../MatchIQ-iOS-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MatchIQ-ios
+          path: MatchIQ-iOS-unsigned.ipa
+
+  release:
+    name: Publikacja (Release „latest”)
+    needs: [android, ios]
+    if: always() && needs.android.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: MatchIQ – najnowsza wersja
+          body: |
+            **Android:** pobierz `MatchIQ.apk`, otwórz na telefonie i zezwól na instalację z tego źródła.
+            **iPhone:** `MatchIQ-iOS-unsigned.ipa` instaluje się przez Sideloadly / AltStore (darmowe Apple ID, ważność 7 dni) albo użyj wersji web: https://diketes.github.io/matchiq/ (Safari → Udostępnij → Do ekranu początkowego).
+            Kompilacja: ${{ github.sha }}
+          files: |
+            out/MatchIQ.apk
+            out/MatchIQ-iOS-unsigned.ipa
+          fail_on_unmatched_files: false
+          prerelease: false
+
+  pages:
+    name: Strona web / PWA (GitHub Pages)
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build:mobile
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

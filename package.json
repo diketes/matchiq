@@ -1,0 +1,47 @@
+{
+  "name": "matchiq",
+  "version": "1.0.0",
+  "description": "MatchIQ – analiza meczów piłkarskich i tenisowych na żywo: statystyki, forma, składy, predykcje.",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -n server,vite -c blue,magenta \"node server/index.mjs\" \"vite\"",
+    "build": "vite build",
+    "build:mobile": "vite build --mode mobile",
+    "start": "node server/index.mjs --open",
+    "serve": "node server/index.mjs",
+    "desktop": "electron .",
+    "typecheck": "tsc --noEmit",
+    "cap:sync": "npm run build:mobile && cap sync",
+    "android:apk": "npm run cap:sync && cd android && gradlew assembleRelease",
+    "android:open": "cap open android",
+    "ios:open": "cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/ios": "^8.5.2",
+    "@react-three/drei": "^9.114.0",
+    "@react-three/fiber": "^8.17.10",
+    "compression": "^1.7.4",
+    "express": "^4.21.1",
+    "framer-motion": "^11.11.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2",
+    "@types/express": "^4.17.21",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.169.0",
+    "@vitejs/plugin-react": "^4.3.3",
+    "concurrently": "^9.0.1",
+    "electron": "^28.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
