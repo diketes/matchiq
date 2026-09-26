@@ -1,0 +1,4 @@
+generated: 2026-09-26T10:06:38.367Z
+football matches: 24312, tennis: 11471
+backtest test: n=6968 model acc=0.547 ll=0.957 | market acc=0 ll=0
+params: {"homeAtt":1.1,"awayAtt":0.9,"formWeight":0.1,"recencyWeight":0,"shrinkK":13,"rho":-0.12,"eloWeight":0.6,"venueWeight":1.5,"restWeight":0,"h2hWeight":0.06,"xgWeight":0.5,"stakesWeight":0.03,"absenceWeight":0.04,"newsWeight":1}
